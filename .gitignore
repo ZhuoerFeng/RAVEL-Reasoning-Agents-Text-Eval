@@ -1,0 +1,10 @@
+__pycache__
+glm_api_request
+logs
+ravel_results
+*.png
+*.pdf
+inference_results
+evaluation_results
+runs
+backups

@@ -1,0 +1,5 @@
+﻿Dataset,Avg_Instr,Max_Instr,Min_Instr,Avg_Input,Max_Input,Avg_Reference,Max_Reference,Total_Count
+cloze,44.4,60,33,2037.44,4795,422.04,1458,200
+condition,109.94,183,64,359.57,750,1779.8,3894,200
+edit,178.0,178,178,2434.84,4338,982.32,2159,200
+end2end,86.62,171,33,0.0,0,1856.66,3967,200

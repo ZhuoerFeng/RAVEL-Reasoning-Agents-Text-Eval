@@ -1,0 +1,5 @@
+﻿task_type,Dataset,Avg_Instr,Max_Instr,Min_Instr,Avg_Input,Max_Input,Avg_Reference,Max_Reference,Total_Count
+cloze,english_dataset.jsonl,19.0,19,19,951.89,5179,408.55,2412,150
+condition,english_dataset.jsonl,246.72,387,141,239.23,342,1546.07,4863,99
+edit,english_dataset.jsonl,85.0,85,85,405.72,1229,419.47,1904,110
+end2end,english_dataset.jsonl,67.17,86,43,54.18,73,1624.09,5744,99

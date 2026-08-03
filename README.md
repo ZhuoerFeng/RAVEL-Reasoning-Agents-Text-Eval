@@ -16,8 +16,8 @@ driven by CLI flags — the model under test, the judge model, the language, the
 protocol, and where results are written are all configurable, with no source edits required.
 
 <p align="center">
-  <img src="english_dataset/benchmark_analysis.png" width="720" alt="C3EBench composition: task types, sub-tasks, and length distributions."><br>
-  <em>C3EBench composition — task-type mix, sub-task domains, and instruction/reference length distributions (English split).</em>
+  <img src="assets/main_fig.png" width="820" alt="RAVEL agentic writing loop: a reasoning-agent policy drives outline, draft, review, and refine actions over a shared synthesis state via a context manager."><br>
+  <em>RAVEL — a reasoning-agent policy drives <code>outline → draft → review → refine</code> actions over a shared synthesis state, coordinated by a context manager, until it emits the final text.</em>
 </p>
 
 ---
@@ -55,6 +55,11 @@ task types:
 | **End-to-End** | `end2end` | Generate a complete piece from an instruction, genre, brief, audience, and length budget. |
 
 Outputs are scored by an LLM judge against the reference and the task's rubric.
+
+<p align="center">
+  <img src="assets/data_fig.png" width="760" alt="The four C3EBench task types: End2End (instruction to document), Expand (instruction plus outline to document), Cloze (masked document to recovered fill-ins), and Edit (text with critiques to refined text)."><br>
+  <em>The four C3EBench task types — <strong>End2End</strong> (instruction → document), <strong>Expand</strong> (instruction + outline → document), <strong>Cloze</strong> (masked document → recovered fill-ins), and <strong>Edit</strong> (text + critiques → refined text).</em>
+</p>
 
 **RAVEL** wraps a model in an explicit multi-role writing process (planner, writer,
 reviewer, revisor) so that *how* a model writes — how often it revises, when it stops,
@@ -129,6 +134,11 @@ interface, so switching providers requires no code changes.
 The two splits live in `english_dataset/` and `chinese_dataset/`. Each has a `readme.md`
 documenting the JSON schema for every task type, a `stat.csv` with length statistics, and
 rendered figures under `*_plots/`.
+
+<p align="center">
+  <img src="assets/benchmark_analysis.png" width="760" alt="C3EBench composition: task-type mix, sub-task domains, and instruction/reference length distributions."><br>
+  <em>C3EBench composition — task-type mix, sub-task domains, and instruction/reference length distributions (English split).</em>
+</p>
 
 | Split | File | Items (cloze / condition / edit / end2end) |
 |---|---|---|

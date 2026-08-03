@@ -14,7 +14,14 @@ Features:
 import json
 from typing import Dict, List, Optional
 from agent_prompts import get_prompts
-from glm_api_request.model import GateWays
+# glm_api_request is now OPTIONAL. Models are reached through the dependency-light
+# llm_client (OpenAI/Anthropic SDKs, env-configurable). GateWays is kept only as an
+# annotation fallback so type hints resolve when glm_api_request is absent.
+try:
+    from glm_api_request.model import GateWays
+except Exception:  # noqa: BLE001
+    GateWays = object  # type: ignore
+from llm_client import make_client
 from tenacity import retry, wait_fixed, stop_after_attempt
 import re
 from local_logger import SessionLogger
@@ -236,7 +243,7 @@ def _build_model_registry(
     registry: Dict[str, GateWays] = {}
     for role, mname in name_map.items():
         if mname not in instance_cache:
-            instance_cache[mname] = GateWays(model_name=mname)
+            instance_cache[mname] = make_client(mname)
         registry[role] = instance_cache[mname]
 
     return registry

@@ -1,231 +1,539 @@
+"""
+Unified multi-agent writing orchestrator.
+
+Supports both Chinese ("zh") and English ("en") via a `language` parameter.
+
+Features:
+  - Per-role model specification (planner / writer / reviewer / revisor)
+  - Per-section revision limit to prevent infinite review-revise loops
+  - Error feedback into state so the LLM can see and react to failures
+  - History recorded with real success/failure status; visible to LLM in state
+  - Resume from the latest snapshot in an existing save_dir
+"""
+
 import json
-from typing import Callable, Dict, List
-from agent_prompts import SYSTEM_PROMPT, PROMPT_EDITOR_OUTLINE, PROMPT_WRITER_DRAFT, PROMPT_REVIEWER_CRITIQUE, PROMPT_REVISOR_PARAGRAPH
-from glm_api_request.model import GateWays
+from typing import Dict, List, Optional
+from agent_prompts import get_prompts
+# glm_api_request is now OPTIONAL. Models are reached through the dependency-light
+# llm_client (OpenAI/Anthropic SDKs, env-configurable). GateWays is kept only as an
+# annotation fallback so type hints resolve when glm_api_request is absent.
+try:
+    from glm_api_request.model import GateWays
+except Exception:  # noqa: BLE001
+    GateWays = object  # type: ignore
+from llm_client import make_client
 from tenacity import retry, wait_fixed, stop_after_attempt
 import re
 from local_logger import SessionLogger
 
-# model = GateWays(model_name="deepseek-v3.2")
 
+# ============================================================
+# Utilities
+# ============================================================
 
 def extract_json_from_llm(text: str) -> dict:
+    """Extract a JSON dict from LLM output.
+
+    Supports: direct JSON, Markdown-wrapped JSON, JSON with surrounding text.
     """
-    从 LLM 输出中提取 JSON 字典。
-    支持: 1. 直接返回的 JSON 2. Markdown 包裹的 JSON 3. 带有杂言杂语的 JSON
-    """
-    # 核心正则：匹配从第一个 { 到最后一个 }
-    # 能够处理嵌套的大括号和换行
     match = re.search(r"(\{.*\})", text, re.DOTALL)
-    
     if match:
         json_str = match.group(1)
         try:
-            # 尝试解析
             return json.loads(json_str)
         except json.JSONDecodeError:
-            # 容错处理：有时 LLM 会多给一个逗号或特殊的控制字符
-            # 这里可以引入更强大的库如 json5, 或者进行简单的字符串清洗
-            # 简单清洗逻辑示例：
             json_str = json_str.strip().replace("\n", " ")
             try:
                 return json.loads(json_str)
-            except:
-                raise ValueError(f"无法解析提取到的 JSON 字符串: {json_str}")
+            except Exception:
+                raise ValueError(f"Unable to parse extracted JSON string: {json_str}")
     else:
-        raise ValueError(f"LLM 输出中未发现 JSON 结构: {text}")
+        raise ValueError(f"No JSON structure found in LLM output: {text}")
 
 
 @retry(wait=wait_fixed(2), stop=stop_after_attempt(3))
-def get_llm_response(model_instance: GateWays, system_prompt: str, user_message: str) -> str:
-    """调用 LLM 获取响应，带重试机制"""
+def get_llm_response(model_instance: GateWays, system_prompt: Optional[str], user_message: str) -> str:
+    """Call LLM with retry mechanism."""
     if system_prompt:
         message = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message}
+            {"role": "user", "content": user_message},
         ]
-    else: 
-        message = [
-            {"role": "user", "content": user_message}
-        ]
-    response = model_instance.get_api_result(
-        messages=message,
-        temperature=0.2,
-    )
+    else:
+        message = [{"role": "user", "content": user_message}]
+    response = model_instance.get_api_result(messages=message, temperature=0.2)
     print(response)
     return response.choices[0].message.content
 
 
-# --- 状态管理 (MDP State) ---
+# ============================================================
+# State Management (MDP State)
+# ============================================================
+
+# Keep only the most recent N history entries visible to the LLM
+# to avoid context bloat while still providing useful decision memory.
+_MAX_VISIBLE_HISTORY = 10
+
+
 class WritingState:
     def __init__(self, topic: str, style_guide: str):
         self.meta = {
             "topic": topic,
             "style_guide": style_guide,
-            "status": "INITIALIZING"
+            "status": "INITIALIZING",
         }
-        self.outline: List[Dict] = []  # 存储结构：{"id": 1, "title": "...", "points": "...", "status": "pending"}
-        self.manuscript: Dict[int, Dict] = {} # Key: section_id, Value: {"content": "", "summary": "", "score": 0}
-        self.history: List[str] = []
+        self.outline: List[Dict] = []
+        # Key: section_id (int), Value: {content, summary, score, feedback, revision_count}
+        self.manuscript: Dict[int, Dict] = {}
+        # Structured history entries (dicts), visible to LLM
+        self.history: List[Dict] = []
 
-    def to_json(self):
+    def to_json(self) -> str:
+        """Serialize state to JSON. History is truncated to the most recent entries."""
+        visible_history = self.history[-_MAX_VISIBLE_HISTORY:]
         return json.dumps({
             "meta": self.meta,
             "outline": self.outline,
-            "manuscript": self.manuscript
+            "manuscript": self.manuscript,
+            "recent_history": visible_history,
         }, ensure_ascii=False, indent=2)
 
+    def to_full_dict(self) -> dict:
+        """Full state dict for snapshot persistence (includes complete history)."""
+        return {
+            "meta": self.meta,
+            "outline": self.outline,
+            "manuscript": {str(k): v for k, v in self.manuscript.items()},
+            "history": self.history,
+        }
 
-# --- 1. 将 Action 封装为 Callable Functions (Tools) ---
+    @classmethod
+    def from_dict(cls, data: dict) -> "WritingState":
+        """Restore a WritingState from a snapshot dict."""
+        topic = data["meta"]["topic"]
+        style_guide = data["meta"]["style_guide"]
+        state = cls(topic, style_guide)
+        state.meta = data["meta"]
+        state.outline = data.get("outline", [])
+        # Restore manuscript with int keys
+        raw_ms = data.get("manuscript", {})
+        state.manuscript = {int(k): v for k, v in raw_ms.items()}
+        state.history = data.get("history", [])
+        return state
+
+    def record_history(self, step: int, action: str, section_id, status: str,
+                       error_msg: str = ""):
+        """Append a structured history entry."""
+        entry = {
+            "step": step,
+            "action": action,
+            "section_id": section_id,
+            "status": status,  # "success" | "error" | "skipped"
+        }
+        if error_msg:
+            entry["error"] = error_msg
+        self.history.append(entry)
+
+
+# ============================================================
+# Atomic Writing Tools
+# ============================================================
+
 class WritingTools:
-    """所有写作相关的原子操作，核心 Agent 的 '手'"""
-    
+    """Atomic operations for the Orchestrator."""
+
     @staticmethod
-    def plan_outline(model_instance: GateWays, topic: str, style_guide: str, **kwargs) -> Dict:
-        """输入主题和风格，生成 JSON 格式的大纲"""
-        response = get_llm_response(model_instance, None, PROMPT_EDITOR_OUTLINE + f"\nTopic: {topic}, Style_guide: {style_guide}")
+    def plan_outline(model_instance: GateWays, prompts: dict,
+                     topic: str, style_guide: str, **kwargs) -> Dict:
+        prompt = prompts["PROMPT_EDITOR_OUTLINE"]
+        response = get_llm_response(
+            model_instance, None,
+            prompt + f"\nTopic: {topic}, Style_guide: {style_guide}",
+        )
         return extract_json_from_llm(response)
 
     @staticmethod
-    def write_paragraph(model_instance: GateWays, topic: str, style_guide: str, section_title: str, prev_summary: str, points: str, **kwargs) -> Dict:
-        """根据大纲节点、上文摘要和关键点撰写段落"""
-        context = {"topic": topic, "style_guide": style_guide, "section_title": section_title, "prev_summary": prev_summary, "points": points}
-        response = get_llm_response(model_instance, None, PROMPT_WRITER_DRAFT + '\n' + json.dumps(context, ensure_ascii=False, indent=2))
+    def write_paragraph(model_instance: GateWays, prompts: dict,
+                        topic: str, style_guide: str, section_title: str,
+                        prev_summary: str, points: str, **kwargs) -> Dict:
+        prompt = prompts["PROMPT_WRITER_DRAFT"]
+        context = {
+            "topic": topic, "style_guide": style_guide,
+            "section_title": section_title,
+            "prev_summary": prev_summary, "points": points,
+        }
+        response = get_llm_response(
+            model_instance, None,
+            prompt + "\n" + json.dumps(context, ensure_ascii=False, indent=2),
+        )
         return extract_json_from_llm(response)
 
     @staticmethod
-    def review_content(model_instance: GateWays, content: str, style_guide: str, points: str, **kwargs) -> Dict:
-        """对段落进行打分和评估，返回结构化 JSON"""
+    def review_content(model_instance: GateWays, prompts: dict,
+                       content: str, style_guide: str, points: str,
+                       **kwargs) -> Dict:
+        prompt = prompts["PROMPT_REVIEWER_CRITIQUE"]
         context = {"style_guide": style_guide, "points": points, "content": content}
-        response = get_llm_response(model_instance, None, PROMPT_REVIEWER_CRITIQUE + '\n' + json.dumps(context, ensure_ascii=False, indent=2))
+        response = get_llm_response(
+            model_instance, None,
+            prompt + "\n" + json.dumps(context, ensure_ascii=False, indent=2),
+        )
         return extract_json_from_llm(response)
 
     @staticmethod
-    def revise_paragraph(model_instance: GateWays, content: str, style_guide: str, points: str, feedback: str, **kwargs) -> Dict:
-        """根据反馈意见重写段落"""
-        context =  {"style_guide": style_guide, "points": points, "content": content, "feedback": feedback}
-        response = get_llm_response(model_instance, None, PROMPT_REVISOR_PARAGRAPH + '\n' + json.dumps(context, ensure_ascii=False, indent=2))
+    def revise_paragraph(model_instance: GateWays, prompts: dict,
+                         content: str, style_guide: str, points: str,
+                         feedback: str, **kwargs) -> Dict:
+        prompt = prompts["PROMPT_REVISOR_PARAGRAPH"]
+        context = {
+            "style_guide": style_guide, "points": points,
+            "content": content, "feedback": feedback,
+        }
+        response = get_llm_response(
+            model_instance, None,
+            prompt + "\n" + json.dumps(context, ensure_ascii=False, indent=2),
+        )
         return extract_json_from_llm(response)
 
 
-# --- 2. 核心智能体 (The Orchestrator / Brain) ---
+# ============================================================
+# Model Registry for per-role specification
+# ============================================================
+
+# Default model name used when no per-role override is provided.
+DEFAULT_MODEL_NAME = "deepseek-v3.2"
+
+# Role keys used by WritingManager
+ROLE_PLANNER = "planner"
+ROLE_WRITER = "writer"
+ROLE_REVIEWER = "reviewer"
+ROLE_REVISOR = "revisor"
+ALL_ROLES = [ROLE_PLANNER, ROLE_WRITER, ROLE_REVIEWER, ROLE_REVISOR]
+
+# Mapping from tool name to role key
+_TOOL_TO_ROLE = {
+    "plan_outline": ROLE_PLANNER,
+    "write_paragraph": ROLE_WRITER,
+    "review_content": ROLE_REVIEWER,
+    "revise_paragraph": ROLE_REVISOR,
+}
+
+
+def _build_model_registry(
+    model_name: str = DEFAULT_MODEL_NAME,
+    role_models: Optional[Dict[str, str]] = None,
+) -> Dict[str, GateWays]:
+    """Build a {role -> GateWays} mapping, reusing instances for same model name.
+
+    Args:
+        model_name: Default model for all roles.
+        role_models: Optional overrides, e.g. {"reviewer": "gpt-5.2-2025-12-11"}.
+
+    Returns:
+        Dict mapping each role to its GateWays instance.
+    """
+    role_models = role_models or {}
+    # Collect unique model names
+    name_map = {}
+    for role in ALL_ROLES:
+        name_map[role] = role_models.get(role, model_name)
+
+    # Deduplicate GateWays instances by model name
+    instance_cache: Dict[str, GateWays] = {}
+    registry: Dict[str, GateWays] = {}
+    for role, mname in name_map.items():
+        if mname not in instance_cache:
+            instance_cache[mname] = make_client(mname)
+        registry[role] = instance_cache[mname]
+
+    return registry
+
+
+# ============================================================
+# Orchestrator
+# ============================================================
+
 class WritingManager:
-    def __init__(self, topic: str, style_guide: str, save_dir: str, model_name: str = "deepseek-v3.2"):
-        self.model_instance = GateWays(model_name=model_name)
-        self.state = WritingState(topic, style_guide)
-        # --- 新增日志器 ---
+    """LLM-driven autonomous writing orchestrator.
+
+    Args:
+        topic: The writing topic / instruction.
+        style_guide: Genre or style requirement.
+        save_dir: Directory for logs and snapshots.
+        model_name: Default model name for all roles.
+        language: Prompt language, "zh" or "en".
+        role_models: Optional per-role model overrides, e.g.
+            {"planner": "gpt-5.2", "reviewer": "claude-sonnet-4-20250514"}.
+            Roles not specified fall back to `model_name`.
+        max_steps: Maximum execution steps before forced termination.
+        max_revisions_per_section: Maximum review-revise cycles per section.
+            When exceeded the section is force-completed.
+        resume: If True, attempt to resume from the latest snapshot in save_dir.
+    """
+
+    def __init__(
+        self,
+        topic: str,
+        style_guide: str,
+        save_dir: str = "./logs",
+        model_name: str = DEFAULT_MODEL_NAME,
+        language: str = "zh",
+        role_models: Optional[Dict[str, str]] = None,
+        max_steps: int = 50,
+        max_revisions_per_section: int = 3,
+        resume: bool = False,
+        # Legacy param kept for backward compatibility
+        revisor_model_name: Optional[str] = None,
+    ):
+        # Merge legacy param into role_models
+        if revisor_model_name and not role_models:
+            role_models = {ROLE_REVISOR: revisor_model_name}
+        elif revisor_model_name and role_models and ROLE_REVISOR not in role_models:
+            role_models[ROLE_REVISOR] = revisor_model_name
+
+        self.model_registry = _build_model_registry(model_name, role_models)
+        # The "policy" model (for determine_next_step) defaults to the planner model
+        self.policy_model = self.model_registry[ROLE_PLANNER]
+
+        self.prompts = get_prompts(language)
+        self.max_steps = max_steps
+        self.max_revisions_per_section = max_revisions_per_section
+        self.save_dir = save_dir
+
         self.session_logger = SessionLogger(topic, save_dir=save_dir)
-        # ----------------
-        # 注册可用工具
+
+        # Register tools
         self.tools = {
             "plan_outline": WritingTools.plan_outline,
             "write_paragraph": WritingTools.write_paragraph,
             "review_content": WritingTools.review_content,
-            "revise_paragraph": WritingTools.revise_paragraph
+            "revise_paragraph": WritingTools.revise_paragraph,
         }
 
-    def determine_next_step(self) -> Dict:
-        """
-        纯 LLM 驱动的自主决策。
-        不再使用 if-else 规则，而是通过 Context(State) + Policy(System Prompt) 获取 Action。
-        """
-        # 1. 准备当前环境的“快照”
-        current_state_json = self.state.to_json()
-        
-        # 2. 构建面向决策者的 Prompt
-        # 我们不再告诉它怎么选，只提供状态，让它通过理解 SYSTEM_PROMPT 中的状态流转来决策
-        decision_prompt = f"""
-### Current Writing State:
-{current_state_json}
+        # State initialization or resume
+        self._execution_step_counter = 0
+        if resume:
+            self._try_resume(topic, style_guide)
+        else:
+            self.state = WritingState(topic, style_guide)
 
----
-请根据当前的 Writing State，思考并决定下一步的动作。请确保你的动作能够推动项目向 `finish` 状态迈进。
-"""
+    def _try_resume(self, topic: str, style_guide: str):
+        """Attempt to resume from the latest snapshot, fall back to fresh state."""
+        step, snapshot = self.session_logger.find_latest_snapshot()
+        if snapshot is not None:
+            self.state = WritingState.from_dict(snapshot)
+            self._execution_step_counter = step
+            print(f"Resumed from step {step} (save_dir={self.save_dir})")
+            self.session_logger.logger.info(f"Resumed execution from step {step}")
+        else:
+            self.state = WritingState(topic, style_guide)
+            print("No snapshot found, starting fresh.")
+
+    # ------------------------------------------------------------------
+    # Model selection helper
+    # ------------------------------------------------------------------
+
+    def _get_model_for_tool(self, tool_name: str) -> GateWays:
+        """Return the GateWays instance for the given tool's role."""
+        role = _TOOL_TO_ROLE.get(tool_name)
+        if role:
+            return self.model_registry[role]
+        return self.policy_model
+
+    # ------------------------------------------------------------------
+    # Decision
+    # ------------------------------------------------------------------
+
+    def determine_next_step(self) -> Dict:
+        """Pure LLM-driven autonomous decision making."""
+        current_state_json = self.state.to_json()
+        decision_prompt = self.prompts["DECISION_PROMPT_TEMPLATE"].format(
+            current_state_json=current_state_json,
+        )
 
         try:
-            # 调用 LLM
-            response_text = get_llm_response(self.model_instance, SYSTEM_PROMPT, decision_prompt)
-            # --- 记录 LLM 调用 ---
+            response_text = get_llm_response(
+                self.policy_model,
+                self.prompts["SYSTEM_PROMPT"],
+                decision_prompt,
+            )
             self.session_logger.log_llm_call(decision_prompt, response_text)
-            # -------------------
-            # 解析决策
             decision = extract_json_from_llm(response_text)
-            
-            # 简单校验，确保生成的 params 包含必要的 section_id (除非是 plan_outline 或 finish)
-            # 这能增强系统的鲁棒性
-            # --- 记录思考和决策 ---
+
             self.session_logger.log_step(
-                decision.get("thought"), 
-                decision.get("action"), 
-                decision.get("params")
+                decision.get("thought"),
+                decision.get("action"),
+                decision.get("params"),
             )
             return decision
-            
+
         except Exception as e:
             print(f"Decision Error: {e}")
-            # 降级处理或重试逻辑
-            return {"thought": "解析出错", "action": "retry", "params": {}}
-        
+            return {"thought": "Parsing error", "action": "retry", "params": {}}
+
+    # ------------------------------------------------------------------
+    # Revision limit check
+    # ------------------------------------------------------------------
+
+    def _check_revision_limit(self, action_name: str, params: dict) -> bool:
+        """Check whether a revise/review action should be blocked due to
+        the per-section revision limit.
+
+        If the section has been revised >= max_revisions_per_section times,
+        force it to 'completed' and return True (meaning: skip this action).
+        """
+        if action_name not in ("revise_paragraph", "review_content"):
+            return False
+
+        section_id = params.get("section_id")
+        if section_id is None:
+            return False
+        section_id = int(section_id)
+
+        ms = self.state.manuscript.get(section_id)
+        if ms is None:
+            return False
+
+        if ms.get("revision_count", 0) >= self.max_revisions_per_section:
+            # Force-complete this section
+            self.state.outline[section_id]["status"] = "completed"
+            msg = (f"Section {section_id} reached max revisions "
+                   f"({self.max_revisions_per_section}), force-completing.")
+            print(f"  [State] {msg}")
+            self.state.record_history(
+                self._execution_step_counter, action_name, section_id,
+                "skipped", error_msg=msg,
+            )
+            return True
+
+        return False
+
+    # ------------------------------------------------------------------
+    # Main execution loop
+    # ------------------------------------------------------------------
 
     def execute(self):
-        """自治运行主循环"""
-        excecution_step_counter = 0
+        """Main loop for autonomous execution."""
         print("Starting Agentic Workflow...")
+
         while True:
-            # 1. 观察状态并决策 (Observation -> Thought -> Action)
-            # (s_t) -> (a_t) -> t++ -> (s_{t+1})
             decision = self.determine_next_step()
             action_name = decision["action"]
-            params = decision["params"]
-            excecution_step_counter += 1
-            self.session_logger.set_logger_setp(excecution_step_counter)
-            print(f"\n--- Step {excecution_step_counter} ---")
+            params = decision.get("params", {})
+            self._execution_step_counter += 1
+            step = self._execution_step_counter
+            self.session_logger.set_logger_step(step)
+            print(f"\n--- Step {step} ---")
 
+            # --- Termination conditions ---
             if action_name == "finish":
-                # --- 任务结束，保存最终文档 ---
-                self.session_logger.save_final_manuscript(self.state.manuscript, self.state.outline)
+                self.session_logger.save_final_manuscript(
+                    self.state.manuscript, self.state.outline,
+                )
+                self.state.record_history(step, "finish", None, "success")
+                self.session_logger.save_snapshot(self.state.to_full_dict())
                 print("Task Completed!")
                 break
-            elif excecution_step_counter > 50:
-                print("Reached maximum execution steps. Terminating to avoid infinite loop.")
-                self.session_logger.save_final_manuscript(self.state.manuscript, self.state.outline)
+
+            if step > self.max_steps:
+                print("Reached maximum execution steps. Terminating.")
+                self.state.record_history(
+                    step, action_name, params.get("section_id"),
+                    "skipped", error_msg="max_steps exceeded",
+                )
+                self.session_logger.save_final_manuscript(
+                    self.state.manuscript, self.state.outline,
+                )
+                self.session_logger.save_snapshot(self.state.to_full_dict())
                 break
-            elif action_name == "retry":
+
+            if action_name == "retry":
                 print("Retrying decision due to previous error...")
+                self.state.record_history(step, "retry", None, "skipped")
                 continue
-            
-            # 2. 调用工具 (Execution)
+
+            # --- Revision limit guard ---
+            if self._check_revision_limit(action_name, params):
+                self.session_logger.save_snapshot(self.state.to_full_dict())
+                continue
+
+            # --- Validate action ---
+            tool_func = self.tools.get(action_name)
+            if tool_func is None:
+                msg = f"Unknown action: {action_name}"
+                print(f"  {msg}")
+                self.state.record_history(step, action_name,
+                                          params.get("section_id"),
+                                          "error", error_msg=msg)
+                self.session_logger.save_snapshot(self.state.to_full_dict())
+                continue
+
+            # --- Validate section_id bounds ---
+            section_id = params.get("section_id")
+            if section_id is not None:
+                try:
+                    sid = int(section_id)
+                    if sid < 0 or sid >= len(self.state.outline):
+                        msg = (f"section_id {sid} out of range "
+                               f"[0, {len(self.state.outline)})")
+                        print(f"  {msg}")
+                        self.state.record_history(step, action_name, sid,
+                                                  "error", error_msg=msg)
+                        self.session_logger.save_snapshot(self.state.to_full_dict())
+                        continue
+                except (ValueError, TypeError):
+                    msg = f"Invalid section_id: {section_id}"
+                    print(f"  {msg}")
+                    self.state.record_history(step, action_name, section_id,
+                                              "error", error_msg=msg)
+                    self.session_logger.save_snapshot(self.state.to_full_dict())
+                    continue
+
+            # --- Execute tool ---
             print(f"Executing Action: {action_name}")
+            result = {}
+            model_for_tool = self._get_model_for_tool(action_name)
             try:
-                tool_func = self.tools.get(action_name)
                 print(f"  Params: {json.dumps(params, ensure_ascii=False)}")
-                result = tool_func(model_instance=self.model_instance, **params)
+                result = tool_func(
+                    model_instance=model_for_tool,
+                    prompts=self.prompts,
+                    **params,
+                )
                 print(f"  Result: {result}")
             except Exception as e:
-                print(f"  Action Execution Error: {e}")
-            # 3. 更新状态 (State Transition)
+                msg = f"Action Execution Error: {e}"
+                print(f"  {msg}")
+                self.state.record_history(step, action_name,
+                                          params.get("section_id"),
+                                          "error", error_msg=str(e))
+                self.session_logger.save_snapshot(self.state.to_full_dict())
+                continue  # skip state update on tool failure
+
+            # --- Update state ---
             try:
                 self._update_state(action_name, params, result)
+                self.state.record_history(step, action_name,
+                                          params.get("section_id"), "success")
             except Exception as e:
-                print(f"  State Update Error: {e}")
-            # --- 每次更新状态后保存快照 ---
-            self.session_logger.save_snapshot(json.loads(self.state.to_json()))
+                msg = f"State Update Error: {e}"
+                print(f"  {msg}")
+                self.state.record_history(step, action_name,
+                                          params.get("section_id"),
+                                          "error", error_msg=str(e))
 
-    def _update_state(self, action, params, result):
-        """
-        根据动作结果更新全局状态对象。
-        状态流转逻辑：
-        1. plan_outline -> 初始化 outline 列表
-        2. write_paragraph -> 填充 manuscript[id]，更新 outline[id].status = 'drafted'
-        3. review_content -> 更新 manuscript[id].score，更新 outline[id].status 为 'completed' 或 'revision_needed'
-        4. revise_paragraph -> 覆盖 manuscript[id].content，状态设回 'drafted' 重新触发评审
-        """
-        
-        # 提取 section_id (决策层 params 中应包含此字段，以便定位更新哪个章节)
+            # --- Save snapshot ---
+            self.session_logger.save_snapshot(self.state.to_full_dict())
+
+    # ------------------------------------------------------------------
+    # State transitions
+    # ------------------------------------------------------------------
+
+    def _update_state(self, action: str, params: dict, result: dict):
+        """Update global state based on action results."""
         section_id = params.get("section_id")
 
-        if action == 'plan_outline':
-            # result 结构示例: {"title": "...", "outline": [{"section_title": "...", "points": "..."}, ...]}
+        if action == "plan_outline":
             self.state.meta["title"] = result.get("title", self.state.meta["topic"])
             self.state.outline = []
             for idx, item in enumerate(result.get("outline", [])):
@@ -233,61 +541,118 @@ class WritingManager:
                     "id": idx,
                     "section_title": item["section_title"],
                     "points": item["points"],
-                    "status": "pending"  # 初始状态
+                    "status": "pending",
                 })
-            print(f"  [State] 大纲规划完成，共 {len(self.state.outline)} 个章节。")
+            self.state.meta["status"] = "PLANNING_DONE"
+            print(f"  [State] Outline planned with {len(self.state.outline)} sections.")
 
-        elif action == 'write_paragraph':
-            # result 结构示例: {"content": "...", "summary": "..."}
+        elif action == "write_paragraph":
             if section_id is not None:
                 section_id = int(section_id)
                 self.state.manuscript[section_id] = {
                     "content": result["content"],
                     "summary": result["summary"],
                     "score": 0.0,
-                    "feedback": ""
+                    "feedback": "",
+                    "revision_count": 0,
                 }
                 self.state.outline[section_id]["status"] = "drafted"
-                print(f"  [State] 章节 {section_id} 撰写完成，待评审。")
+                print(f"  [State] Section {section_id} drafted, awaiting review.")
 
-        elif action == 'review_content':
-            # result 结构示例: {"score": 8.5, "feedback": "..."}
+        elif action == "review_content":
             if section_id is not None:
                 section_id = int(section_id)
                 self.state.manuscript[section_id]["score"] = result["score"]
                 self.state.manuscript[section_id]["feedback"] = result["feedback"]
-                
+
                 if result["score"] >= 8.0:
                     self.state.outline[section_id]["status"] = "completed"
-                    print(f"  [State] 章节 {section_id} 评审通过 (Score: {result['score']})。")
+                    print(f"  [State] Section {section_id} passed review "
+                          f"(Score: {result['score']}).")
                 else:
                     self.state.outline[section_id]["status"] = "revision_needed"
-                    print(f"  [State] 章节 {section_id} 评审未通过 (Score: {result['score']})，需要修改。")
+                    print(f"  [State] Section {section_id} failed review "
+                          f"(Score: {result['score']}), revision needed.")
 
-        elif action == 'revise_paragraph':
-            # result 结构示例: {"revised_content": "...", "change_log": "..."}
+        elif action == "revise_paragraph":
             if section_id is not None:
                 section_id = int(section_id)
                 self.state.manuscript[section_id]["content"] = result["revised_content"]
-                # 修改后状态重置为 drafted，以便下一次循环进入 review_content
                 self.state.outline[section_id]["status"] = "drafted"
-                print(f"  [State] 章节 {section_id} 已根据反馈优化，重新提交评审。")
+                # Increment revision counter
+                self.state.manuscript[section_id]["revision_count"] = (
+                    self.state.manuscript[section_id].get("revision_count", 0) + 1
+                )
+                rev_count = self.state.manuscript[section_id]["revision_count"]
+                print(f"  [State] Section {section_id} revised "
+                      f"(revision {rev_count}/{self.max_revisions_per_section}), "
+                      f"resubmitting for review.")
 
-        # 记录操作日志（可选）
-        self.state.history.append(f"Action: {action} | Section: {section_id} | Result: Success")
 
-
+# ============================================================
+# CLI
+# ============================================================
 
 if __name__ == "__main__":
-    topic = "请创作一篇探讨人们对六十岁生活态度的文章，分析不同人群对步入老年的期待与焦虑，阐述老年生活的价值意义，并就如何更好地面对老年生活提出建议。核心观点是：年龄只是数字，关键在于保持积极心态，有尊严地度过老年生活。"
-    style_guide = "议论文"
-    
-    manager = WritingManager(topic, style_guide)
-    manager.execute()
+    import argparse
 
-#     text = """{\n  "thought": "当前尚未生成大纲，也没有章节内容，处于初始化阶段。下一步应先规划整体结构，明确章节安排，确保故事线索清晰，为后续写作打下基础。",\n  "action": "plan_outline",\n  "params": {\n    "topic": "我想写一篇大概6500字左右的小说，故事设定在春节前夕的一个防疫封控区。主要想写一个叫小蕊的主人公，她和科长孙科以及其他基层干部一起执行防疫任务，在这个过程中，她慢慢理解了基层工作的艰辛和这些干部的责任与精神，最终实现了自我成长和情感升华。",\n    "style": "小说"\n  }\n}
-# """
-#     res = extract_json_from_llm(text)
-#     print(json.dumps(res, indent=2, ensure_ascii=False))
-#     ex = WritingTools.plan_outline(**res['params'])
-#     print(json.dumps(ex, indent=2, ensure_ascii=False))
+    parser = argparse.ArgumentParser(description="Run the agentic writing workflow.")
+    parser.add_argument("--language", type=str, default="zh", choices=["zh", "en"],
+                        help="Prompt language (default: zh)")
+    parser.add_argument("--model_name", type=str, default=DEFAULT_MODEL_NAME,
+                        help="Default model name for all roles")
+    parser.add_argument("--planner_model", type=str, default=None,
+                        help="Model for the planner role (outline generation + decision)")
+    parser.add_argument("--writer_model", type=str, default=None,
+                        help="Model for the writer role")
+    parser.add_argument("--reviewer_model", type=str, default=None,
+                        help="Model for the reviewer role")
+    parser.add_argument("--revisor_model", type=str, default=None,
+                        help="Model for the revisor role")
+    parser.add_argument("--save_dir", type=str, default="./logs",
+                        help="Directory for logs and snapshots")
+    parser.add_argument("--max_steps", type=int, default=50,
+                        help="Maximum execution steps")
+    parser.add_argument("--max_revisions", type=int, default=3,
+                        help="Maximum revisions per section")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from the latest snapshot in save_dir")
+    args = parser.parse_args()
+
+    # Build role_models dict from CLI args
+    role_models = {}
+    if args.planner_model:
+        role_models[ROLE_PLANNER] = args.planner_model
+    if args.writer_model:
+        role_models[ROLE_WRITER] = args.writer_model
+    if args.reviewer_model:
+        role_models[ROLE_REVIEWER] = args.reviewer_model
+    if args.revisor_model:
+        role_models[ROLE_REVISOR] = args.revisor_model
+
+    if args.language == "zh":
+        topic = ("请创作一篇探讨人们对六十岁生活态度的文章，分析不同人群对步入老年的期待与焦虑，"
+                 "阐述老年生活的价值意义，并就如何更好地面对老年生活提出建议。"
+                 "核心观点是：年龄只是数字，关键在于保持积极心态，有尊严地度过老年生活。")
+        style_guide = "议论文"
+    else:
+        topic = ("Please write an article discussing attitudes toward life at age sixty, "
+                 "analyzing expectations and anxieties about entering old age among different "
+                 "groups, explaining the value and meaning of senior life, and providing "
+                 "suggestions on how to better face it. The core view is: age is just a "
+                 "number; the key is to maintain a positive mindset and spend the senior "
+                 "years with dignity.")
+        style_guide = "Argumentative essay"
+
+    manager = WritingManager(
+        topic=topic,
+        style_guide=style_guide,
+        save_dir=args.save_dir,
+        model_name=args.model_name,
+        language=args.language,
+        role_models=role_models or None,
+        max_steps=args.max_steps,
+        max_revisions_per_section=args.max_revisions,
+        resume=args.resume,
+    )
+    manager.execute()

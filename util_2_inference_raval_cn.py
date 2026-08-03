@@ -6,7 +6,6 @@ from typing import List
 import argparse
 from core_agents import WritingState, WritingTools, WritingManager
 
-# ... [保留你原有的 import 和类定义: WritingState, WritingTools, WritingManager, extract_json_from_llm, get_llm_response] ...
 
 def run_single_writing_task(task_data: dict, model_name: str = "deepseek-v3.2") -> dict:
     """
@@ -16,14 +15,15 @@ def run_single_writing_task(task_data: dict, model_name: str = "deepseek-v3.2") 
     topic = task_data.get("instruction", "")
     infer_id = task_data.get("infer_id", "")
     style_guide = task_data.get("style", "通俗易懂") # 默认风格
-    save_dir = f'ravel_results/chinese/{model_name}/{infer_id}' 
-    
+    save_dir = f'ravel_results/chinese/{model_name}/{infer_id}'
+
     if not topic:
         return {"status": "error", "message": "Empty topic"}
 
     try:
         print(f"\n>>> 开始处理任务: {topic[:20]}...")
-        manager = WritingManager(topic, style_guide, model_name=model_name, save_dir=save_dir)
+        manager = WritingManager(topic, style_guide, model_name=model_name,
+                                 save_dir=save_dir, language="zh")
         manager.execute()
         return {"status": "success", "topic": topic}
     except Exception as e:

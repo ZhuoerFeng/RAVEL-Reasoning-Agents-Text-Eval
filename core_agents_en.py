@@ -8,7 +8,8 @@ from local_logger import SessionLogger
 
 # model = GateWays(model_name="deepseek-v3.2")
 
-default_model = GateWays(model_name="gemini-3-pro-preview")
+# default_model = GateWays(model_name="gemini-3.1-pro-preview-high")
+default_model = GateWays(model_name="gpt-5.2-2025-12-11")
 
 
 def extract_json_from_llm(text: str) -> dict:
@@ -98,9 +99,9 @@ class WritingTools:
     def revise_paragraph(model_instance: GateWays, content: str, style_guide: str, points: str, feedback: str, **kwargs) -> Dict:
         """Rewrites paragraph based on feedback"""
         context =  {"style_guide": style_guide, "points": points, "content": content, "feedback": feedback}
-        response = get_llm_response(model_instance, None, PROMPT_REVISOR_PARAGRAPH + '\n' + json.dumps(context, ensure_ascii=False, indent=2))
+        # response = get_llm_response(model_instance, None, PROMPT_REVISOR_PARAGRAPH + '\n' + json.dumps(context, ensure_ascii=False, indent=2))
         # # ablate on STRONG Revisor
-        # response = get_llm_response(default_model, None, PROMPT_REVISOR_PARAGRAPH + '\n' + json.dumps(context, ensure_ascii=False, indent=2))
+        response = get_llm_response(default_model, None, PROMPT_REVISOR_PARAGRAPH + '\n' + json.dumps(context, ensure_ascii=False, indent=2))
 
         return extract_json_from_llm(response)
 
@@ -131,8 +132,8 @@ Based on the current Writing State, think and decide the next action. Ensure you
 """
 
         try:
-            # response_text = get_llm_response(self.model_instance, SYSTEM_PROMPT, decision_prompt)
-            response_text = get_llm_response(default_model, SYSTEM_PROMPT, decision_prompt)
+            response_text = get_llm_response(self.model_instance, SYSTEM_PROMPT, decision_prompt)
+            # response_text = get_llm_response(default_model, SYSTEM_PROMPT, decision_prompt)
             self.session_logger.log_llm_call(decision_prompt, response_text)
             decision = extract_json_from_llm(response_text)
             
